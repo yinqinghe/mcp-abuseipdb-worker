@@ -10,5 +10,4 @@ compatibility_flags = ["nodejs_compat"]
 # 生产环境中敏感信息建议通过 npx wrangler secret put ABUSEIPDB_API_KEYS 设置
 ABUSEIPDB_API_KEYS = ""
 ABUSEIPDB_API_KEY = ""
-VIRUSTOTAL_API_KEYS = ""
-VIRUSTOTAL_API_KEY = ""
+
