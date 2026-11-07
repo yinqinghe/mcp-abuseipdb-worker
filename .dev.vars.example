@@ -1,0 +1,10 @@
+# AbuseIPDB API Keys
+# 支持单个 Key 或多个 Key（逗号、分号或换行分隔）
+# 多 Key 自动轮询查询（Round-Robin），并在遇到 429 配额耗尽或 401/403 失效时自动跳过尝试下一个 Key
+ABUSEIPDB_API_KEYS=your_key_1,your_key_2,your_key_3
+
+# 兼容单个 Key 配置
+# ABUSEIPDB_API_KEY=your_key_1
+
+# 亦兼容 VIRUSTOTAL_API_KEYS 环境变量名称
+# VIRUSTOTAL_API_KEYS=your_key_1,your_key_2

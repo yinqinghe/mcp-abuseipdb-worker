@@ -1,0 +1,14 @@
+name = "mcp-abuseipdb"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# 支持单个 Key (ABUSEIPDB_API_KEY) 或多个 Key 逗号/换行分隔 (ABUSEIPDB_API_KEYS)
+# 亦兼容 VIRUSTOTAL_API_KEYS / VIRUSTOTAL_API_KEY 命名
+# 多个 Key 会自动轮询查询并在 Key 超额/失效时自动故障转移跳过
+# 生产环境中敏感信息建议通过 npx wrangler secret put ABUSEIPDB_API_KEYS 设置
+ABUSEIPDB_API_KEYS = ""
+ABUSEIPDB_API_KEY = ""
+VIRUSTOTAL_API_KEYS = ""
+VIRUSTOTAL_API_KEY = ""

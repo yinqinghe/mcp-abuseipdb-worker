@@ -3,12 +3,16 @@
  * 
  * Supports:
  * - MCP SSE Transport: GET /sse & POST /message?sessionId=...
- * - MCP Streamable HTTP / Direct JSON-RPC: POST /mcp & POST /
+ * - MCP Streamable HTTP / Direct JSON-RPC: POST /mcp, POST /, POST /sse
  * - Health check & tools metadata: GET / & GET /health
+ * - Multi-Key Support & Round-Robin Polling & Auto-Fallback on invalid/rate-limited keys
  */
 
 export interface Env {
   ABUSEIPDB_API_KEY?: string;
+  ABUSEIPDB_API_KEYS?: string;
+  VIRUSTOTAL_API_KEY?: string;
+  VIRUSTOTAL_API_KEYS?: string;
 }
 
 // Category mapping defined by AbuseIPDB
@@ -40,6 +44,106 @@ const CATEGORIES: Record<number, string> = {
 
 // Global in-memory map for active SSE sessions within the isolate
 const sseSessions = new Map<string, WritableStreamDefaultWriter<Uint8Array>>();
+
+// Helper to mask keys for safe logging
+export function maskApiKey(key: string): string {
+  if (!key) return "none";
+  if (key.length <= 8) return "****";
+  return `${key.slice(0, 4)}...${key.slice(-4)}`;
+}
+
+// Key pool with round-robin polling and cooldown tracking
+export class ApiKeyPool {
+  private keys: string[] = [];
+  private currentIndex = 0;
+  private cooldowns = new Map<string, number>();
+
+  constructor(keys?: string | string[]) {
+    if (keys) {
+      this.setKeys(keys);
+    }
+  }
+
+  setKeys(input?: string | string[]): void {
+    if (!input) return;
+    const rawList = Array.isArray(input) ? input : [input];
+    const parsed: string[] = [];
+    for (const item of rawList) {
+      if (!item) continue;
+      const str = String(item).trim();
+      if (!str) continue;
+      if (str.startsWith("[") && str.endsWith("]")) {
+        try {
+          const arr = JSON.parse(str);
+          if (Array.isArray(arr)) {
+            for (const x of arr) {
+              const s = String(x).trim().replace(/^['"]|['"]$/g, "");
+              if (s) parsed.push(s);
+            }
+            continue;
+          }
+        } catch {}
+      }
+      for (const k of str.split(/[\r\n,;]+/)) {
+        const clean = k.trim().replace(/^['"]|['"]$/g, "");
+        if (clean) parsed.push(clean);
+      }
+    }
+    const unique = Array.from(new Set(parsed));
+    if (unique.length > 0) {
+      this.keys = unique;
+      if (this.currentIndex >= this.keys.length) {
+        this.currentIndex = 0;
+      }
+    }
+  }
+
+  getKeys(): string[] {
+    return this.keys;
+  }
+
+  markCooldown(key: string, durationMs: number): void {
+    this.cooldowns.set(key, Date.now() + durationMs);
+  }
+
+  isCooldown(key: string): boolean {
+    const expires = this.cooldowns.get(key);
+    if (!expires) return false;
+    if (Date.now() >= expires) {
+      this.cooldowns.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  clearCooldown(key: string): void {
+    this.cooldowns.delete(key);
+  }
+
+  getNextKeyIndex(): number {
+    if (this.keys.length === 0) return -1;
+    const n = this.keys.length;
+    const selected = this.currentIndex;
+    this.currentIndex = (this.currentIndex + 1) % n;
+    return selected;
+  }
+}
+
+const keyPool = new ApiKeyPool();
+
+export function getKeyPool(): ApiKeyPool {
+  return keyPool;
+}
+
+export function updateKeyPoolFromEnv(env: Env): void {
+  const candidateKeys = [
+    env.ABUSEIPDB_API_KEYS || "",
+    env.ABUSEIPDB_API_KEY || "",
+    env.VIRUSTOTAL_API_KEYS || "",
+    env.VIRUSTOTAL_API_KEY || "",
+  ];
+  keyPool.setKeys(candidateKeys);
+}
 
 // Helper to set CORS headers
 function corsHeaders(): Record<string, string> {
@@ -149,7 +253,7 @@ function getToolsDefinition() {
 async function makeAbuseIPDBRequest(
   url: string,
   options: RequestInit,
-  maxRetries = 3
+  maxRetries = 2
 ): Promise<Response> {
   let lastError: unknown;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -159,7 +263,7 @@ async function makeAbuseIPDBRequest(
     } catch (err) {
       lastError = err;
       if (attempt < maxRetries - 1) {
-        await new Promise((resolve) => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+        await new Promise((resolve) => setTimeout(resolve, 500 * Math.pow(2, attempt)));
       }
     }
   }
@@ -257,15 +361,83 @@ function handleApiError(response: Response, data: any): string {
   return `❌ API Error (${status}): ${errorDetail}\n\nFull response: ${JSON.stringify(data)}`;
 }
 
-// Tool execution logic
-async function executeTool(name: string, args: any, apiKey?: string): Promise<{ text: string; isError?: boolean }> {
-  if (!apiKey) {
+interface ApiAttemptResult {
+  success: boolean;
+  text: string;
+  isKeyFailure?: boolean;
+  status?: number;
+}
+
+// Execute with multi-key round-robin rotation and automatic fallback
+async function executeWithKeyRotation(
+  env: Env,
+  action: (apiKey: string) => Promise<ApiAttemptResult>
+): Promise<{ text: string; isError?: boolean }> {
+  updateKeyPoolFromEnv(env);
+  const keys = keyPool.getKeys();
+  const n = keys.length;
+
+  if (n === 0) {
     return {
-      text: "❌ ABUSEIPDB_API_KEY environment variable is required. Configure it via wrangler secret or .dev.vars.",
+      text: "❌ No API key configured. Please set ABUSEIPDB_API_KEYS (or ABUSEIPDB_API_KEY / VIRUSTOTAL_API_KEYS) via wrangler secret or .dev.vars.",
       isError: true,
     };
   }
 
+  const startIndex = keyPool.getNextKeyIndex();
+  const failureLogs: string[] = [];
+
+  for (let attempt = 0; attempt < n; attempt++) {
+    const keyIdx = (startIndex + attempt) % n;
+    const currentKey = keys[keyIdx];
+
+    // If key is on cooldown, and at least one other key is active, skip
+    if (n > 1 && keyPool.isCooldown(currentKey)) {
+      const anyActive = keys.some((k) => !keyPool.isCooldown(k));
+      if (anyActive) {
+        console.log(`[Key rotation] Key ${maskApiKey(currentKey)} is on cooldown, skipping.`);
+        continue;
+      }
+    }
+
+    try {
+      const res = await action(currentKey);
+      if (res.success) {
+        keyPool.clearCooldown(currentKey);
+        return { text: res.text, isError: false };
+      }
+
+      // If it's a key failure (401, 403, 429) and we have other keys to try:
+      if (res.isKeyFailure && n > 1) {
+        const cooldownMs = res.status === 429 ? 60 * 1000 : 300 * 1000;
+        keyPool.markCooldown(currentKey, cooldownMs);
+        const reason = res.status === 429 ? "Rate limit / quota exceeded" : `Auth/Key error (${res.status})`;
+        console.warn(`[Key rotation] Key ${maskApiKey(currentKey)} failed: ${reason}. Trying next key...`);
+        failureLogs.push(`Key [${maskApiKey(currentKey)}]: ${reason}`);
+        continue;
+      }
+
+      // Non-key failure (e.g. invalid arguments): return error without rotating
+      return { text: res.text, isError: true };
+    } catch (err: any) {
+      if (n > 1) {
+        keyPool.markCooldown(currentKey, 30 * 1000);
+        console.warn(`[Key rotation] Network error with key ${maskApiKey(currentKey)}: ${err.message}. Trying next key...`);
+        failureLogs.push(`Key [${maskApiKey(currentKey)}]: ${err.message}`);
+        continue;
+      }
+      return { text: `❌ Request failed: ${err.message || String(err)}`, isError: true };
+    }
+  }
+
+  return {
+    text: `❌ All ${n} API key(s) failed or are unavailable:\n${failureLogs.join("\n")}`,
+    isError: true,
+  };
+}
+
+// Tool execution logic
+async function executeTool(name: string, args: any, env: Env): Promise<{ text: string; isError?: boolean }> {
   const baseUrl = "https://api.abuseipdb.com/api/v2";
 
   if (name === "check_ip") {
@@ -285,7 +457,7 @@ async function executeTool(name: string, args: any, apiKey?: string): Promise<{ 
       params.append("verbose", "");
     }
 
-    try {
+    return executeWithKeyRotation(env, async (apiKey) => {
       const res = await makeAbuseIPDBRequest(`${baseUrl}/check?${params.toString()}`, {
         method: "GET",
         headers: {
@@ -297,13 +469,17 @@ async function executeTool(name: string, args: any, apiKey?: string): Promise<{ 
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        return { text: handleApiError(res, data), isError: true };
+        const isKeyErr = res.status === 401 || res.status === 403 || res.status === 429;
+        return {
+          success: false,
+          text: handleApiError(res, data),
+          isKeyFailure: isKeyErr,
+          status: res.status,
+        };
       }
 
-      return { text: formatCheckResponse(data) };
-    } catch (err: any) {
-      return { text: `❌ API request failed: ${err.message || String(err)}`, isError: true };
-    }
+      return { success: true, text: formatCheckResponse(data) };
+    });
   }
 
   if (name === "report_ip") {
@@ -328,7 +504,7 @@ async function executeTool(name: string, args: any, apiKey?: string): Promise<{ 
       formData.append("timestamp", timestamp);
     }
 
-    try {
+    return executeWithKeyRotation(env, async (apiKey) => {
       const res = await makeAbuseIPDBRequest(`${baseUrl}/report`, {
         method: "POST",
         headers: {
@@ -342,13 +518,17 @@ async function executeTool(name: string, args: any, apiKey?: string): Promise<{ 
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        return { text: handleApiError(res, data), isError: true };
+        const isKeyErr = res.status === 401 || res.status === 403 || res.status === 429;
+        return {
+          success: false,
+          text: handleApiError(res, data),
+          isKeyFailure: isKeyErr,
+          status: res.status,
+        };
       }
 
-      return { text: formatReportResponse(data) };
-    } catch (err: any) {
-      return { text: `❌ API request failed: ${err.message || String(err)}`, isError: true };
-    }
+      return { success: true, text: formatReportResponse(data) };
+    });
   }
 
   return { text: `Unknown tool: ${name}`, isError: true };
@@ -368,8 +548,6 @@ async function handleJsonRpc(
   }
 
   const { id, method, params } = rpcReq;
-
-  // Handle MCP Notifications (no response required when id is omitted)
   const isNotification = id === undefined || id === null;
 
   switch (method) {
@@ -416,7 +594,7 @@ async function handleJsonRpc(
     case "tools/call": {
       const toolName = params?.name;
       const toolArgs = params?.arguments ?? {};
-      const { text, isError } = await executeTool(toolName, toolArgs, env.ABUSEIPDB_API_KEY);
+      const { text, isError } = await executeTool(toolName, toolArgs, env);
 
       return {
         jsonrpc: "2.0",
@@ -461,13 +639,17 @@ export default {
       });
     }
 
+    updateKeyPoolFromEnv(env);
+
     // Health / Landing check
     if ((url.pathname === "/" || url.pathname === "/health") && method === "GET") {
+      const keys = keyPool.getKeys();
       return jsonResponse({
         name: "AbuseIPDB MCP Server (Cloudflare Worker)",
         version: "1.3.0",
         status: "healthy",
-        hasApiKey: Boolean(env.ABUSEIPDB_API_KEY),
+        hasApiKey: keys.length > 0,
+        configuredKeysCount: keys.length,
         endpoints: {
           sse: `${url.origin}/sse`,
           message: `${url.origin}/message?sessionId=:sessionId`,
@@ -479,6 +661,11 @@ export default {
 
     // --- MCP Transport 1: SSE (GET /sse) ---
     if (url.pathname === "/sse" && method === "GET") {
+      const keys = keyPool.getKeys();
+      if (keys.length === 0) {
+        return textResponse("ABUSEIPDB_API_KEYS (or ABUSEIPDB_API_KEY) is not configured", 500);
+      }
+
       const sessionId = crypto.randomUUID();
       const { readable, writable } = new TransformStream();
       const writer = writable.getWriter();
@@ -546,7 +733,6 @@ export default {
 
     // --- MCP Transport 1: SSE Message Posting (POST /message) ---
     if (url.pathname === "/message" && method === "POST") {
-      const sessionId = url.searchParams.get("sessionId") || request.headers.get("Mcp-Session-Id");
       let body: any;
       try {
         body = await request.json();
