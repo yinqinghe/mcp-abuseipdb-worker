@@ -641,26 +641,31 @@ export default {
 
     updateKeyPoolFromEnv(env);
 
-    // Health / Landing check
-    if ((url.pathname === "/" || url.pathname === "/health") && method === "GET") {
-      const keys = keyPool.getKeys();
-      return jsonResponse({
-        name: "AbuseIPDB MCP Server (Cloudflare Worker)",
-        version: "1.3.0",
-        status: "healthy",
-        hasApiKey: keys.length > 0,
-        configuredKeysCount: keys.length,
-        endpoints: {
-          sse: `${url.origin}/sse`,
-          message: `${url.origin}/message?sessionId=:sessionId`,
-          mcp: `${url.origin}/mcp`,
-        },
-        tools: getToolsDefinition().map((t) => ({ name: t.name, description: t.description })),
-      });
+    // Health / Landing check or Root SSE
+    if ((url.pathname === "/" || url.pathname === "/health" || url.pathname === "/mcp") && method === "GET") {
+      const acceptHeader = request.headers.get("Accept") || "";
+      if (acceptHeader.includes("text/event-stream") && (url.pathname === "/" || url.pathname === "/mcp")) {
+        // Fall through to SSE handler below
+      } else {
+        const keys = keyPool.getKeys();
+        return jsonResponse({
+          name: "AbuseIPDB MCP Server (Cloudflare Worker)",
+          version: "1.3.0",
+          status: "healthy",
+          hasApiKey: keys.length > 0,
+          configuredKeysCount: keys.length,
+          endpoints: {
+            sse: `${url.origin}/sse`,
+            message: `${url.origin}/message?sessionId=:sessionId`,
+            mcp: `${url.origin}/mcp`,
+          },
+          tools: getToolsDefinition().map((t) => ({ name: t.name, description: t.description })),
+        });
+      }
     }
 
-    // --- MCP Transport 1: SSE (GET /sse) ---
-    if (url.pathname === "/sse" && method === "GET") {
+    // --- MCP Transport 1: SSE (GET /sse or GET / with text/event-stream) ---
+    if ((url.pathname === "/sse" || url.pathname === "/" || url.pathname === "/mcp") && method === "GET") {
       const keys = keyPool.getKeys();
       if (keys.length === 0) {
         return textResponse("ABUSEIPDB_API_KEYS (or ABUSEIPDB_API_KEY) is not configured", 500);
@@ -673,8 +678,8 @@ export default {
 
       sseSessions.set(sessionId, writer);
 
-      // Send initial endpoint event as required by MCP SSE spec
-      const endpointUrl = `/message?sessionId=${sessionId}`;
+      // Send initial endpoint event as required by MCP SSE spec (using absolute origin URL)
+      const endpointUrl = `${url.origin}/message?sessionId=${sessionId}`;
       const initEvent = `event: endpoint\ndata: ${endpointUrl}\n\n`;
       writer.write(encoder.encode(initEvent));
 
@@ -733,6 +738,7 @@ export default {
 
     // --- MCP Transport 1: SSE Message Posting (POST /message) ---
     if (url.pathname === "/message" && method === "POST") {
+      const sessionId = url.searchParams.get("sessionId") || request.headers.get("Mcp-Session-Id");
       let body: any;
       try {
         body = await request.json();
@@ -743,7 +749,19 @@ export default {
       // Process RPC message
       const responseRpc = await handleJsonRpc(body, env);
 
-      // Return response respecting Accept header
+      // If active SSE writer exists in this isolate, notify it
+      if (sessionId && sseSessions.has(sessionId) && responseRpc) {
+        const writer = sseSessions.get(sessionId)!;
+        const encoder = new TextEncoder();
+        try {
+          const sseData = `event: message\ndata: ${JSON.stringify(responseRpc)}\n\n`;
+          writer.write(encoder.encode(sseData));
+        } catch {
+          sseSessions.delete(sessionId);
+        }
+      }
+
+      // Return response respecting Accept header (stateless fallback ensures no 404!)
       return formatMcpResponse(responseRpc, request.headers.get("Accept"));
     }
 
