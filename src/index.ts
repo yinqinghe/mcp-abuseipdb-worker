@@ -270,7 +270,7 @@ async function makeAbuseIPDBRequest(
   throw lastError;
 }
 
-// Format check_ip response
+// Format check_ip response (Token-optimized for AI)
 function formatCheckResponse(data: any): string {
   try {
     const ipData = data?.data;
@@ -278,29 +278,50 @@ function formatCheckResponse(data: any): string {
       return `❌ Invalid response structure from AbuseIPDB: ${JSON.stringify(data)}`;
     }
 
-    let result = "AbuseIPDB Check Results\n\n";
-    result += `IP Address: ${ipData.ipAddress}\n`;
-    result += `Abuse Confidence Score: ${ipData.abuseConfidenceScore}%\n`;
-    result += `Is Public: ${ipData.isPublic ? "Yes" : "No"}\n`;
-    result += `Is Whitelisted: ${ipData.isWhitelisted ? "Yes" : "No"}\n`;
-
-    const countryName = ipData.countryName || "Unknown";
-    const countryCode = ipData.countryCode || "N/A";
-    result += `Country: ${countryName} (${countryCode})\n`;
-    result += `ISP: ${ipData.isp || "N/A"}\n`;
-    result += `Usage Type: ${ipData.usageType || "N/A"}\n`;
-    result += `Domain: ${ipData.domain || "N/A"}\n`;
-    result += `Total Reports: ${ipData.totalReports ?? 0}\n`;
-
-    if (ipData.lastReportedAt) {
-      result += `Last Reported: ${ipData.lastReportedAt}\n`;
+    const score = ipData.abuseConfidenceScore ?? 0;
+    let riskTier = "Clean / Safe";
+    let riskEmoji = "✅";
+    if (score >= 75) {
+      riskTier = "High Risk / Malicious";
+      riskEmoji = "🚨";
+    } else if (score >= 25) {
+      riskTier = "Medium / Suspicious";
+      riskEmoji = "⚠️";
+    } else if (score > 0) {
+      riskTier = "Low Risk";
+      riskEmoji = "🟡";
     }
 
-    if ("isTor" in ipData) {
-      result += `Is Tor: ${ipData.isTor ? "Yes" : "No"}\n`;
+    const lines: string[] = [
+      `### ${riskEmoji} AbuseIPDB IP Report: \`${ipData.ipAddress}\``,
+      `- **Score**: ${score}% (${riskTier})${ipData.isWhitelisted ? " | [Whitelisted]" : ""}${ipData.isTor ? " | [Tor Exit Node]" : ""}`,
+    ];
+
+    // Network / Location in one concise line
+    const geoParts = [
+      ipData.countryName ? `${ipData.countryName}${ipData.countryCode ? ` (${ipData.countryCode})` : ""}` : null,
+      ipData.isp ? `ISP: ${ipData.isp}` : null,
+      ipData.usageType && ipData.usageType !== "N/A" ? ipData.usageType : null,
+      ipData.domain && ipData.domain !== "N/A" ? `Domain: ${ipData.domain}` : null,
+    ].filter(Boolean);
+    if (geoParts.length > 0) {
+      lines.push(`- **Network**: ${geoParts.join(" | ")}`);
     }
 
+    // Reports summary
+    const totalReports = ipData.totalReports ?? 0;
+    const numUsers = ipData.numDistinctUsers;
+    const reportsSummary = [
+      `${totalReports} report${totalReports === 1 ? "" : "s"}`,
+      numUsers ? `by ${numUsers} distinct reporter${numUsers === 1 ? "" : "s"}` : null,
+      ipData.lastReportedAt ? `Last: ${ipData.lastReportedAt}` : "Last: Never",
+    ].filter(Boolean).join(", ");
+    lines.push(`- **Reports**: ${reportsSummary}`);
+
+    // Categories and compact preview of comments
     const categoryNames: string[] = [];
+    const recentComments: { date?: string; text: string }[] = [];
+
     if (Array.isArray(ipData.reports) && ipData.reports.length > 0) {
       for (const report of ipData.reports) {
         if (Array.isArray(report.categories)) {
@@ -311,31 +332,43 @@ function formatCheckResponse(data: any): string {
             }
           }
         }
+        if (report.comment && recentComments.length < 3) {
+          const trimmedComment = String(report.comment).trim();
+          if (trimmedComment && !recentComments.some((c) => c.text === trimmedComment)) {
+            recentComments.push({
+              date: report.reportedAt ? String(report.reportedAt).split("T")[0] : undefined,
+              text: trimmedComment.length > 100 ? `${trimmedComment.slice(0, 97)}...` : trimmedComment,
+            });
+          }
+        }
       }
     }
 
     if (categoryNames.length > 0) {
-      result += `Categories: ${categoryNames.join(", ")}\n`;
-    } else {
-      result += "Categories: N/A\n";
+      lines.push(`- **Categories**: ${categoryNames.join(", ")}`);
     }
 
-    return result;
+    // Top recent report comments (compact preview)
+    if (recentComments.length > 0) {
+      lines.push(`- **Recent Reports Preview**:`);
+      for (const c of recentComments) {
+        lines.push(`  • ${c.date ? `[${c.date}] ` : ""}${c.text}`);
+      }
+    }
+
+    return lines.join("\n");
   } catch (err: any) {
     return `❌ Error formatting response: ${err.message || String(err)}`;
   }
 }
 
-// Format report_ip response
+// Format report_ip response (Token-optimized for AI)
 function formatReportResponse(data: any): string {
   const reportData = data?.data;
   if (!reportData) {
     return `❌ Invalid response structure: ${JSON.stringify(data)}`;
   }
-  let result = "IP Address Reported Successfully\n\n";
-  result += `IP Address: ${reportData.ipAddress || "N/A"}\n`;
-  result += `Updated Abuse Confidence Score: ${reportData.abuseConfidenceScore ?? "N/A"}%\n`;
-  return result;
+  return `✅ Successfully reported \`${reportData.ipAddress || "IP"}\` to AbuseIPDB. New Abuse Confidence Score: **${reportData.abuseConfidenceScore ?? "N/A"}%**`;
 }
 
 // Handle API errors and rate limiting
