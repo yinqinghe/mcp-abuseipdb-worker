@@ -16,3 +16,5 @@ build/
 *log*
 *pyproject.toml
 *.tar
+node_modules/
+.wrangler/
